@@ -312,6 +312,11 @@ func (t *AugmentedTask) ExporterInformation() []*PrometheusTaskInfo {
 		var prometheusJobLabel string
 		if prometheusJobNameLabelOverride != "" {
 			prometheusJobLabel = prometheusJobNameLabelOverride
+
+			// some extra parsing to remove unneccessary prefix
+			prometheusJobLabel = strings.TrimPrefix(prometheusJobLabel, "service:")
+			prometheusJobLabel = strings.TrimPrefix(prometheusJobLabel, "service=")
+
 		} else {
 			prometheusJobLabel = d.DockerLabels[*prometheusJobNameLabel]
 		}
