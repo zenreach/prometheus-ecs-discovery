@@ -53,18 +53,22 @@ type labels struct {
 // Docker label for enabling dynamic port detection
 const dynamicPortLabel = "PROMETHEUS_DYNAMIC_EXPORT"
 
-var cluster = flag.String("config.cluster", "", "name of the cluster to scrape")
+var cluster = flag.String("config.cluster", "", "name of the cluster (or clusters if comma separated values) to scrape")
 var outFile = flag.String("config.write-to", "ecs_file_sd.yml", "path of file to write ECS service discovery information to")
 var interval = flag.Duration("config.scrape-interval", 60*time.Second, "interval at which to scrape the AWS API for ECS service discovery information")
 var times = flag.Int("config.scrape-times", 0, "how many times to scrape before exiting (0 = infinite)")
 var roleArn = flag.String("config.role-arn", "", "ARN of the role to assume when scraping the AWS API (optional)")
 var prometheusPortLabel = flag.String("config.port-label", "PROMETHEUS_EXPORTER_PORT", "Docker label to define the scrape port of the application (if missing an application won't be scraped)")
 var prometheusPathLabel = flag.String("config.path-label", "PROMETHEUS_EXPORTER_PATH", "Docker label to define the scrape path of the application")
-var prometheusSchemeLabel= flag.String("config.scheme-label", "PROMETHEUS_EXPORTER_SCHEME", "Docker label to define the scheme of the target application")
+var prometheusSchemeLabel = flag.String("config.scheme-label", "PROMETHEUS_EXPORTER_SCHEME", "Docker label to define the scheme of the target application")
 var prometheusFilterLabel = flag.String("config.filter-label", "", "Docker label (and optionally value) to require to scrape the application")
 var prometheusServerNameLabel = flag.String("config.server-name-label", "PROMETHEUS_EXPORTER_SERVER_NAME", "Docker label to define the server name")
 var prometheusJobNameLabel = flag.String("config.job-name-label", "PROMETHEUS_EXPORTER_JOB_NAME", "Docker label to define the job name")
 var prometheusDynamicPortDetection = flag.Bool("config.dynamic-port-detection", false, fmt.Sprintf("If true, only tasks with the Docker label %s=1 will be scraped", dynamicPortLabel))
+
+// custom prefix and suffix matching
+var exporterPrefix = flag.String("config.prefixMatch", "prometheus", "Match exporter prefix")
+var exporterSuffix = flag.String("config.suffixMatch", "", "Match exporter suffix")
 
 // logError is a convenience function that decodes all possible ECS
 // errors and displays them to standard error.
@@ -131,25 +135,26 @@ type PrometheusTaskInfo struct {
 // container in the task has a PROMETHEUS_EXPORTER_PORT
 //
 // Example:
-//     ...
-//             "Name": "apache",
-//             "DockerLabels": {
-//                  "PROMETHEUS_EXPORTER_PORT": "1234"
-//              },
-//     ...
-//              "PortMappings": [
-//                {
-//                  "ContainerPort": 1883,
-//                  "HostPort": 0,
-//                  "Protocol": "tcp"
-//                },
-//                {
-//                  "ContainerPort": 1234,
-//                  "HostPort": 0,
-//                  "Protocol": "tcp"
-//                }
-//              ],
-//     ...
+//
+//	...
+//	        "Name": "apache",
+//	        "DockerLabels": {
+//	             "PROMETHEUS_EXPORTER_PORT": "1234"
+//	         },
+//	...
+//	         "PortMappings": [
+//	           {
+//	             "ContainerPort": 1883,
+//	             "HostPort": 0,
+//	             "Protocol": "tcp"
+//	           },
+//	           {
+//	             "ContainerPort": 1234,
+//	             "HostPort": 0,
+//	             "Protocol": "tcp"
+//	           }
+//	         ],
+//	...
 func (t *AugmentedTask) ExporterInformation() []*PrometheusTaskInfo {
 	ret := []*PrometheusTaskInfo{}
 	var host string
@@ -198,6 +203,7 @@ func (t *AugmentedTask) ExporterInformation() []*PrometheusTaskInfo {
 		}
 
 		var hostPort int32
+		var prometheusJobNameLabelOverride string
 		if *prometheusDynamicPortDetection {
 			v, ok := d.DockerLabels[dynamicPortLabel]
 			if !ok || v != "1" {
@@ -216,8 +222,37 @@ func (t *AugmentedTask) ExporterInformation() []*PrometheusTaskInfo {
 				hostPort = *port
 			}
 		} else {
+			// Match label keys like SERVICE_*_NAME (regex: ^SERVICE_.*_NAME$)
+			var isPrometheusExporter bool = false
+			var exporterPort int
+			for label, val := range d.DockerLabels {
+				if strings.HasPrefix(label, "SERVICE_") && strings.HasSuffix(label, "_NAME") && (strings.HasPrefix(val, *exporterPrefix) && strings.HasSuffix(val, *exporterSuffix)) {
+					// Extract number between "SERVICE_" and "_NAME"
+					portStr := label[len("SERVICE_") : len(label)-len("_NAME")]
+					if p, err := strconv.Atoi(portStr); err == nil && p > 0 {
+						// Infer exporter port by injecting it into the expected port label
+						d.DockerLabels[*prometheusPortLabel] = strconv.Itoa(p)
+						isPrometheusExporter = true
+						exporterPort = p
+						break
+					}
+				}
+			}
+
+			// infer prometheus exporter job name
+			if isPrometheusExporter {
+				var target string = "SERVICE_" + strconv.Itoa(exporterPort) + "_TAGS"
+				for label, val := range d.DockerLabels {
+					if label == target {
+						// We found the job name label, no need to continue
+						prometheusJobNameLabelOverride = val
+						break
+					}
+				}
+			}
+
 			v, ok := d.DockerLabels[*prometheusPortLabel]
-			if !ok {
+			if !ok && !isPrometheusExporter {
 				// Nope, no Prometheus-exported port in this container def.
 				// This container is no good.  We continue.
 				continue
@@ -235,7 +270,6 @@ func (t *AugmentedTask) ExporterInformation() []*PrometheusTaskInfo {
 				}
 			}
 
-			var exporterPort int
 			var err error
 			if exporterPort, err = strconv.Atoi(v); err != nil || exporterPort < 0 {
 				// This container has an invalid port definition.
@@ -278,10 +312,23 @@ func (t *AugmentedTask) ExporterInformation() []*PrometheusTaskInfo {
 			host = ip
 		}
 
+		// job name override check - added to infer job name
+		var prometheusJobLabel string
+		if prometheusJobNameLabelOverride != "" {
+			prometheusJobLabel = prometheusJobNameLabelOverride
+
+			// some extra parsing to remove unneccessary prefix
+			prometheusJobLabel = strings.TrimPrefix(prometheusJobLabel, "service:")
+			prometheusJobLabel = strings.TrimPrefix(prometheusJobLabel, "service=")
+
+		} else {
+			prometheusJobLabel = d.DockerLabels[*prometheusJobNameLabel]
+		}
+
 		labels := labels{
 			TaskArn:       *t.TaskArn,
 			TaskName:      *t.TaskDefinition.Family,
-			JobName:       d.DockerLabels[*prometheusJobNameLabel],
+			JobName:       prometheusJobLabel,
 			TaskRevision:  fmt.Sprintf("%d", t.TaskDefinition.Revision),
 			TaskGroup:     *t.Group,
 			ClusterArn:    *t.ClusterArn,
@@ -297,7 +344,7 @@ func (t *AugmentedTask) ExporterInformation() []*PrometheusTaskInfo {
 
 		scheme, ok = d.DockerLabels[*prometheusSchemeLabel]
 		if ok {
-		    labels.Scheme = scheme
+			labels.Scheme = scheme
 		}
 
 		ret = append(ret, &PrometheusTaskInfo{
@@ -624,11 +671,12 @@ func main() {
 		var clusters *ecs.ListClustersOutput
 
 		if *cluster != "" {
+			var cluster_names = strings.Split(*cluster, ",")
 			res, err := svc.DescribeClusters(context.Background(), &ecs.DescribeClustersInput{
-				Clusters: []string{*cluster},
+				Clusters: cluster_names,
 			})
 			if err != nil {
-				logError(err)
+				logError(fmt.Errorf("%s", err))
 				return
 			}
 
@@ -638,7 +686,7 @@ func main() {
 			}
 
 			clusters = &ecs.ListClustersOutput{
-				ClusterArns: []string{*cluster},
+				ClusterArns: cluster_names,
 			}
 		} else {
 			c, err := GetClusters(svc)
