@@ -53,7 +53,7 @@ type labels struct {
 // Docker label for enabling dynamic port detection
 const dynamicPortLabel = "PROMETHEUS_DYNAMIC_EXPORT"
 
-var cluster = flag.String("config.cluster", "", "name of the cluster to scrape")
+var cluster = flag.String("config.cluster", "", "name of the cluster (or clusters if comma separated values) to scrape")
 var outFile = flag.String("config.write-to", "ecs_file_sd.yml", "path of file to write ECS service discovery information to")
 var interval = flag.Duration("config.scrape-interval", 60*time.Second, "interval at which to scrape the AWS API for ECS service discovery information")
 var times = flag.Int("config.scrape-times", 0, "how many times to scrape before exiting (0 = infinite)")
@@ -65,6 +65,10 @@ var prometheusFilterLabel = flag.String("config.filter-label", "", "Docker label
 var prometheusServerNameLabel = flag.String("config.server-name-label", "PROMETHEUS_EXPORTER_SERVER_NAME", "Docker label to define the server name")
 var prometheusJobNameLabel = flag.String("config.job-name-label", "PROMETHEUS_EXPORTER_JOB_NAME", "Docker label to define the job name")
 var prometheusDynamicPortDetection = flag.Bool("config.dynamic-port-detection", false, fmt.Sprintf("If true, only tasks with the Docker label %s=1 will be scraped", dynamicPortLabel))
+
+// custom prefix and suffix matching
+var exporterPrefix = flag.String("config.prefixMatch", "prometheus", "Match exporter prefix")
+var exporterSuffix = flag.String("config.suffixMatch", "", "Match exporter suffix")
 
 // logError is a convenience function that decodes all possible ECS
 // errors and displays them to standard error.
@@ -222,7 +226,7 @@ func (t *AugmentedTask) ExporterInformation() []*PrometheusTaskInfo {
 			var isPrometheusExporter bool = false
 			var exporterPort int
 			for label, val := range d.DockerLabels {
-				if strings.HasPrefix(label, "SERVICE_") && strings.HasSuffix(label, "_NAME") && (strings.HasPrefix(val, "prometheus") && strings.HasSuffix(val, "exporter")) {
+				if strings.HasPrefix(label, "SERVICE_") && strings.HasSuffix(label, "_NAME") && (strings.HasPrefix(val, *exporterPrefix) && strings.HasSuffix(val, *exporterSuffix)) {
 					// Extract number between "SERVICE_" and "_NAME"
 					portStr := label[len("SERVICE_") : len(label)-len("_NAME")]
 					if p, err := strconv.Atoi(portStr); err == nil && p > 0 {
@@ -667,11 +671,12 @@ func main() {
 		var clusters *ecs.ListClustersOutput
 
 		if *cluster != "" {
+			var cluster_names = strings.Split(*cluster, ",")
 			res, err := svc.DescribeClusters(context.Background(), &ecs.DescribeClustersInput{
-				Clusters: []string{*cluster},
+				Clusters: cluster_names,
 			})
 			if err != nil {
-				logError(err)
+				logError(fmt.Errorf("%s", err))
 				return
 			}
 
@@ -681,7 +686,7 @@ func main() {
 			}
 
 			clusters = &ecs.ListClustersOutput{
-				ClusterArns: []string{*cluster},
+				ClusterArns: cluster_names,
 			}
 		} else {
 			c, err := GetClusters(svc)
